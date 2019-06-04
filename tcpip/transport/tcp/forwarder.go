@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ func NewForwarder(s *stack.Stack, rcvWnd, maxInFlight int, handler func(*Forward
 		maxInFlight: maxInFlight,
 		handler:     handler,
 		inFlight:    make(map[stack.TransportEndpointID]struct{}),
-		listen:      newListenContext(s, seqnum.Size(rcvWnd), true, 0),
+		listen:      newListenContext(s, nil /* listenEP */, seqnum.Size(rcvWnd), true, 0),
 	}
 }
 
@@ -63,12 +63,12 @@ func NewForwarder(s *stack.Stack, rcvWnd, maxInFlight int, handler func(*Forward
 //
 // This function is expected to be passed as an argument to the
 // stack.SetTransportProtocolHandler function.
-func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv buffer.VectorisedView) bool {
+func (f *Forwarder) HandlePacket(r *stack.Route, id stack.TransportEndpointID, netHeader buffer.View, vv buffer.VectorisedView) bool {
 	s := newSegment(r, id, vv)
 	defer s.decRef()
 
 	// We only care about well-formed SYN packets.
-	if !s.parse() || s.flags != flagSyn {
+	if !s.parse() || !s.csumValid || s.flags != header.TCPFlagSyn {
 		return false
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ import (
 	"github.com/google/netstack/tcpip/network/arp"
 	"github.com/google/netstack/tcpip/network/ipv4"
 	"github.com/google/netstack/tcpip/stack"
-	"github.com/google/netstack/tcpip/transport/ping"
+	"github.com/google/netstack/tcpip/transport/icmp"
 )
 
 const (
@@ -43,7 +43,7 @@ type testContext struct {
 }
 
 func newTestContext(t *testing.T) *testContext {
-	s := stack.New([]string{ipv4.ProtocolName, arp.ProtocolName}, []string{ping.ProtocolName4}, stack.Options{})
+	s := stack.New([]string{ipv4.ProtocolName, arp.ProtocolName}, []string{icmp.ProtocolName4}, stack.Options{})
 
 	const defaultMTU = 65536
 	id, linkEP := channel.New(256, defaultMTU, stackLinkAddr)

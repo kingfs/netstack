@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -128,12 +128,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	linkID := fdbased.New(&fdbased.Options{
+	linkID, err := fdbased.New(&fdbased.Options{
 		FD:             fd,
 		MTU:            mtu,
 		EthernetHeader: *tap,
 		Address:        tcpip.LinkAddress(maddr),
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := s.CreateNIC(1, linkID); err != nil {
 		log.Fatal(err)
 	}
@@ -165,7 +168,7 @@ func main() {
 
 	defer ep.Close()
 
-	if err := ep.Bind(tcpip.FullAddress{0, "", uint16(localPort)}, nil); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{0, "", uint16(localPort)}); err != nil {
 		log.Fatal("Bind failed: ", err)
 	}
 

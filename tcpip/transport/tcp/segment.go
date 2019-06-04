@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,21 +16,12 @@ package tcp
 
 import (
 	"sync/atomic"
+	"time"
 
 	"github.com/google/netstack/tcpip/buffer"
 	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/seqnum"
 	"github.com/google/netstack/tcpip/stack"
-)
-
-// Flags that may be set in a TCP segment.
-const (
-	flagFin = 1 << iota
-	flagSyn
-	flagRst
-	flagPsh
-	flagAck
-	flagUrg
 )
 
 // segment represents a TCP segment. It holds the payload and parsed TCP segment
@@ -54,10 +45,19 @@ type segment struct {
 	ackNumber      seqnum.Value
 	flags          uint8
 	window         seqnum.Size
+	// csum is only populated for received segments.
+	csum uint16
+	// csumValid is true if the csum in the received segment is valid.
+	csumValid bool
 
 	// parsedOptions stores the parsed values from the options in the segment.
-	parsedOptions header.TCPOptions
-	options       []byte
+	parsedOptions  header.TCPOptions
+	options        []byte
+	hasNewSACKInfo bool
+	rcvdTime       time.Time
+	// xmitTime is the last transmit time of this segment. A zero value
+	// indicates that the segment has yet to be transmitted.
+	xmitTime time.Time
 }
 
 func newSegment(r *stack.Route, id stack.TransportEndpointID, vv buffer.VectorisedView) *segment {
@@ -67,6 +67,7 @@ func newSegment(r *stack.Route, id stack.TransportEndpointID, vv buffer.Vectoris
 		route:  r.Clone(),
 	}
 	s.data = vv.Clone(s.views[:])
+	s.rcvdTime = time.Now()
 	return s
 }
 
@@ -78,6 +79,7 @@ func newSegmentFromView(r *stack.Route, id stack.TransportEndpointID, v buffer.V
 	}
 	s.views[0] = v
 	s.data = buffer.NewVectorisedView(len(v), s.views[:1])
+	s.rcvdTime = time.Now()
 	return s
 }
 
@@ -91,6 +93,7 @@ func (s *segment) clone() *segment {
 		window:         s.window,
 		route:          s.route.Clone(),
 		viewToDeliver:  s.viewToDeliver,
+		rcvdTime:       s.rcvdTime,
 	}
 	t.data = s.data.Clone(t.views[:])
 	return t
@@ -114,10 +117,10 @@ func (s *segment) incRef() {
 // as the data length plus one for each of the SYN and FIN bits set.
 func (s *segment) logicalLen() seqnum.Size {
 	l := seqnum.Size(s.data.Size())
-	if s.flagIsSet(flagSyn) {
+	if s.flagIsSet(header.TCPFlagSyn) {
 		l++
 	}
-	if s.flagIsSet(flagFin) {
+	if s.flagIsSet(header.TCPFlagFin) {
 		l++
 	}
 	return l
@@ -125,7 +128,13 @@ func (s *segment) logicalLen() seqnum.Size {
 
 // parse populates the sequence & ack numbers, flags, and window fields of the
 // segment from the TCP header stored in the data. It then updates the view to
-// skip the data. Returns boolean indicating if the parsing was successful.
+// skip the header.
+//
+// Returns boolean indicating if the parsing was successful.
+//
+// If checksum verification is not offloaded then parse also verifies the
+// TCP checksum and stores the checksum and result of checksum verification in
+// the csum and csumValid fields of the segment.
 func (s *segment) parse() bool {
 	h := header.TCP(s.data.First())
 
@@ -146,12 +155,32 @@ func (s *segment) parse() bool {
 
 	s.options = []byte(h[header.TCPMinimumSize:offset])
 	s.parsedOptions = header.ParseTCPOptions(s.options)
-	s.data.TrimFront(offset)
+
+	// Query the link capabilities to decide if checksum validation is
+	// required.
+	verifyChecksum := true
+	if s.route.Capabilities()&stack.CapabilityRXChecksumOffload != 0 {
+		s.csumValid = true
+		verifyChecksum = false
+		s.data.TrimFront(offset)
+	}
+	if verifyChecksum {
+		s.csum = h.Checksum()
+		xsum := s.route.PseudoHeaderChecksum(ProtocolNumber, uint16(s.data.Size()))
+		xsum = h.CalculateChecksum(xsum)
+		s.data.TrimFront(offset)
+		xsum = header.ChecksumVV(s.data, xsum)
+		s.csumValid = xsum == 0xffff
+	}
 
 	s.sequenceNumber = seqnum.Value(h.SequenceNumber())
 	s.ackNumber = seqnum.Value(h.AckNumber())
 	s.flags = h.Flags()
 	s.window = seqnum.Size(h.WindowSize())
-
 	return true
+}
+
+// sackBlock returns a header.SACKBlock that represents this segment.
+func (s *segment) sackBlock() header.SACKBlock {
+	return header.SACKBlock{s.sequenceNumber, s.sequenceNumber.Add(s.logicalLen())}
 }

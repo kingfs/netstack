@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,9 @@
 package tcpip
 
 import (
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -191,5 +193,25 @@ func TestAddressString(t *testing.T) {
 		if got := addr.String(); got != want {
 			t.Errorf("Address(%x).String() = '%s', want = '%s'", addr, got, want)
 		}
+	}
+}
+
+func TestStatsString(t *testing.T) {
+	got := fmt.Sprintf("%+v", Stats{}.FillIn())
+
+	matchers := []string{
+		// Print root-level stats correctly.
+		"UnknownProtocolRcvdPackets:0",
+		// Print protocol-specific stats correctly.
+		"TCP:{ActiveConnectionOpenings:0",
+	}
+
+	for _, m := range matchers {
+		if !strings.Contains(got, m) {
+			t.Errorf("string.Contains(got, %q) = false", m)
+		}
+	}
+	if t.Failed() {
+		t.Logf(`got = fmt.Sprintf("%%+v", Stats{}.FillIn()) = %q`, got)
 	}
 }

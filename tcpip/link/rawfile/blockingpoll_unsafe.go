@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,9 @@ import (
 	"unsafe"
 )
 
-func blockingPoll(fds *pollEvent, nfds int, timeout int64) (int, syscall.Errno) {
+// BlockingPoll is just a stub function that forwards to the poll() system call
+// on non-amd64 platforms.
+func BlockingPoll(fds *PollEvent, nfds int, timeout int64) (int, syscall.Errno) {
 	n, _, e := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(fds)), uintptr(nfds), uintptr(timeout))
 	return int(n), e
 }

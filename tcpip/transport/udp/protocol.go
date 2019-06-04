@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	"github.com/google/netstack/tcpip/buffer"
 	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/stack"
+	"github.com/google/netstack/tcpip/transport/raw"
 	"github.com/google/netstack/waiter"
 )
 
@@ -46,6 +47,12 @@ func (*protocol) Number() tcpip.TransportProtocolNumber {
 // NewEndpoint creates a new udp endpoint.
 func (*protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
 	return newEndpoint(stack, netProto, waiterQueue), nil
+}
+
+// NewRawEndpoint creates a new raw UDP endpoint. It implements
+// stack.TransportProtocol.NewRawEndpoint.
+func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return raw.NewEndpoint(stack, netProto, header.UDPProtocolNumber, waiterQueue)
 }
 
 // MinimumPacketSize returns the minimum valid udp packet size.

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2019 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build linux,amd64
+// +build linux
 
-package rawfile
+package fdbased
 
 import (
-	"syscall"
+	"reflect"
+	"unsafe"
 )
 
-//go:noescape
-func blockingPoll(fds *pollEvent, nfds int, timeout int64) (int, syscall.Errno)
+const virtioNetHdrSize = int(unsafe.Sizeof(virtioNetHdr{}))
+
+func vnetHdrToByteSlice(hdr *virtioNetHdr) (slice []byte) {
+	sh := (*reflect.SliceHeader)(unsafe.Pointer(&slice))
+	sh.Data = uintptr(unsafe.Pointer(hdr))
+	sh.Len = virtioNetHdrSize
+	sh.Cap = virtioNetHdrSize
+	return
+}

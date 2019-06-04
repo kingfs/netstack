@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import (
 	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/seqnum"
 	"github.com/google/netstack/tcpip/stack"
+	"github.com/google/netstack/tcpip/transport/raw"
 	"github.com/google/netstack/waiter"
 )
 
@@ -47,6 +48,10 @@ const (
 
 	// MaxBufferSize is the largest size a receive and send buffer can grow to.
 	maxBufferSize = 4 << 20 // 4MB
+
+	// MaxUnprocessedSegments is the maximum number of unprocessed segments
+	// that can be queued for a given endpoint.
+	MaxUnprocessedSegments = 300
 )
 
 // SACKEnabled option can be used to enable SACK support in the TCP
@@ -101,6 +106,12 @@ func (*protocol) NewEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolN
 	return newEndpoint(stack, netProto, waiterQueue), nil
 }
 
+// NewRawEndpoint creates a new raw TCP endpoint. Raw TCP sockets are currently
+// unsupported. It implements stack.TransportProtocol.NewRawEndpoint.
+func (p *protocol) NewRawEndpoint(stack *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, *tcpip.Error) {
+	return raw.NewEndpoint(stack, netProto, header.TCPProtocolNumber, waiterQueue)
+}
+
 // MinimumPacketSize returns the minimum valid tcp packet size.
 func (*protocol) MinimumPacketSize() int {
 	return header.TCPMinimumSize
@@ -124,12 +135,12 @@ func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.Transpo
 	s := newSegment(r, id, vv)
 	defer s.decRef()
 
-	if !s.parse() {
+	if !s.parse() || !s.csumValid {
 		return false
 	}
 
 	// There's nothing to do if this is already a reset packet.
-	if s.flagIsSet(flagRst) {
+	if s.flagIsSet(header.TCPFlagRst) {
 		return true
 	}
 
@@ -141,13 +152,13 @@ func (*protocol) HandleUnknownDestinationPacket(r *stack.Route, id stack.Transpo
 func replyWithReset(s *segment) {
 	// Get the seqnum from the packet if the ack flag is set.
 	seq := seqnum.Value(0)
-	if s.flagIsSet(flagAck) {
+	if s.flagIsSet(header.TCPFlagAck) {
 		seq = s.ackNumber
 	}
 
 	ack := s.sequenceNumber.Add(s.logicalLen())
 
-	sendTCP(&s.route, s.id, buffer.VectorisedView{}, s.route.DefaultTTL(), flagRst|flagAck, seq, ack, 0, nil)
+	sendTCP(&s.route, s.id, buffer.VectorisedView{}, s.route.DefaultTTL(), header.TCPFlagRst|header.TCPFlagAck, seq, ack, 0, nil /* options */, nil /* gso */)
 }
 
 // SetOption implements TransportProtocol.SetOption.

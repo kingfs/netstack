@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,9 +38,9 @@ const (
 	// ProtocolNumber is the ipv4 protocol number.
 	ProtocolNumber = header.IPv4ProtocolNumber
 
-	// maxTotalSize is maximum size that can be encoded in the 16-bit
+	// MaxTotalSize is maximum size that can be encoded in the 16-bit
 	// TotalLength field of the ipv4 header.
-	maxTotalSize = 0xffff
+	MaxTotalSize = 0xffff
 
 	// buckets is the number of identifier buckets.
 	buckets = 2048
@@ -51,7 +51,6 @@ type endpoint struct {
 	id            stack.NetworkEndpointID
 	linkEP        stack.LinkEndpoint
 	dispatcher    stack.TransportDispatcher
-	echoRequests  chan echoRequest
 	fragmentation *fragmentation.Fragmentation
 }
 
@@ -62,11 +61,8 @@ func (p *protocol) NewEndpoint(nicid tcpip.NICID, addr tcpip.Address, linkAddrCa
 		id:            stack.NetworkEndpointID{LocalAddress: addr},
 		linkEP:        linkEP,
 		dispatcher:    dispatcher,
-		echoRequests:  make(chan echoRequest, 10),
 		fragmentation: fragmentation.NewFragmentation(fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
 	}
-
-	go e.echoReplier()
 
 	return e, nil
 }
@@ -103,8 +99,98 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 	return e.linkEP.MaxHeaderLength() + header.IPv4MinimumSize
 }
 
+// GSOMaxSize returns the maximum GSO packet size.
+func (e *endpoint) GSOMaxSize() uint32 {
+	if gso, ok := e.linkEP.(stack.GSOEndpoint); ok {
+		return gso.GSOMaxSize()
+	}
+	return 0
+}
+
+// writePacketFragments calls e.linkEP.WritePacket with each packet fragment to
+// write. It assumes that the IP header is entirely in hdr but does not assume
+// that only the IP header is in hdr. It assumes that the input packet's stated
+// length matches the length of the hdr+payload. mtu includes the IP header and
+// options. This does not support the DontFragment IP flag.
+func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, hdr buffer.Prependable, payload buffer.VectorisedView, mtu int) *tcpip.Error {
+	// This packet is too big, it needs to be fragmented.
+	ip := header.IPv4(hdr.View())
+	flags := ip.Flags()
+
+	// Update mtu to take into account the header, which will exist in all
+	// fragments anyway.
+	innerMTU := mtu - int(ip.HeaderLength())
+
+	// Round the MTU down to align to 8 bytes. Then calculate the number of
+	// fragments. Calculate fragment sizes as in RFC791.
+	innerMTU &^= 7
+	n := (int(ip.PayloadLength()) + innerMTU - 1) / innerMTU
+
+	outerMTU := innerMTU + int(ip.HeaderLength())
+	offset := ip.FragmentOffset()
+	originalAvailableLength := hdr.AvailableLength()
+	for i := 0; i < n; i++ {
+		// Where possible, the first fragment that is sent has the same
+		// hdr.UsedLength() as the input packet. The link-layer endpoint may depends
+		// on this for looking at, eg, L4 headers.
+		h := ip
+		if i > 0 {
+			hdr = buffer.NewPrependable(int(ip.HeaderLength()) + originalAvailableLength)
+			h = header.IPv4(hdr.Prepend(int(ip.HeaderLength())))
+			copy(h, ip[:ip.HeaderLength()])
+		}
+		if i != n-1 {
+			h.SetTotalLength(uint16(outerMTU))
+			h.SetFlagsFragmentOffset(flags|header.IPv4FlagMoreFragments, offset)
+		} else {
+			h.SetTotalLength(uint16(h.HeaderLength()) + uint16(payload.Size()))
+			h.SetFlagsFragmentOffset(flags, offset)
+		}
+		h.SetChecksum(0)
+		h.SetChecksum(^h.CalculateChecksum())
+		offset += uint16(innerMTU)
+		if i > 0 {
+			newPayload := payload.Clone([]buffer.View{})
+			newPayload.CapLength(innerMTU)
+			if err := e.linkEP.WritePacket(r, gso, hdr, newPayload, ProtocolNumber); err != nil {
+				return err
+			}
+			r.Stats().IP.PacketsSent.Increment()
+			payload.TrimFront(newPayload.Size())
+			continue
+		}
+		// Special handling for the first fragment because it comes from the hdr.
+		if outerMTU >= hdr.UsedLength() {
+			// This fragment can fit all of hdr and possibly some of payload, too.
+			newPayload := payload.Clone([]buffer.View{})
+			newPayloadLength := outerMTU - hdr.UsedLength()
+			newPayload.CapLength(newPayloadLength)
+			if err := e.linkEP.WritePacket(r, gso, hdr, newPayload, ProtocolNumber); err != nil {
+				return err
+			}
+			r.Stats().IP.PacketsSent.Increment()
+			payload.TrimFront(newPayloadLength)
+		} else {
+			// The fragment is too small to fit all of hdr.
+			startOfHdr := hdr
+			startOfHdr.TrimBack(hdr.UsedLength() - outerMTU)
+			emptyVV := buffer.NewVectorisedView(0, []buffer.View{})
+			if err := e.linkEP.WritePacket(r, gso, startOfHdr, emptyVV, ProtocolNumber); err != nil {
+				return err
+			}
+			r.Stats().IP.PacketsSent.Increment()
+			// Add the unused bytes of hdr into the payload that remains to be sent.
+			restOfHdr := hdr.View()[outerMTU:]
+			tmp := buffer.NewVectorisedView(len(restOfHdr), []buffer.View{buffer.NewViewFromBytes(restOfHdr)})
+			tmp.Append(payload)
+			payload = tmp
+		}
+	}
+	return nil
+}
+
 // WritePacket writes a packet to the given destination address and protocol.
-func (e *endpoint) WritePacket(r *stack.Route, hdr buffer.Prependable, payload buffer.VectorisedView, protocol tcpip.TransportProtocolNumber, ttl uint8) *tcpip.Error {
+func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, hdr buffer.Prependable, payload buffer.VectorisedView, protocol tcpip.TransportProtocolNumber, ttl uint8, loop stack.PacketLooping) *tcpip.Error {
 	ip := header.IPv4(hdr.Prepend(header.IPv4MinimumSize))
 	length := uint16(hdr.UsedLength() + payload.Size())
 	id := uint32(0)
@@ -123,15 +209,32 @@ func (e *endpoint) WritePacket(r *stack.Route, hdr buffer.Prependable, payload b
 		DstAddr:     r.RemoteAddress,
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
-	r.Stats().IP.PacketsSent.Increment()
 
-	return e.linkEP.WritePacket(r, hdr, payload, ProtocolNumber)
+	if loop&stack.PacketLoop != 0 {
+		views := make([]buffer.View, 1, 1+len(payload.Views()))
+		views[0] = hdr.View()
+		views = append(views, payload.Views()...)
+		vv := buffer.NewVectorisedView(len(views[0])+payload.Size(), views)
+		e.HandlePacket(r, vv)
+	}
+	if loop&stack.PacketOut == 0 {
+		return nil
+	}
+	if hdr.UsedLength()+payload.Size() > int(e.linkEP.MTU()) && (gso == nil || gso.Type == stack.GSONone) {
+		return e.writePacketFragments(r, gso, hdr, payload, int(e.linkEP.MTU()))
+	}
+	if err := e.linkEP.WritePacket(r, gso, hdr, payload, ProtocolNumber); err != nil {
+		return err
+	}
+	r.Stats().IP.PacketsSent.Increment()
+	return nil
 }
 
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
 // this endpoint.
 func (e *endpoint) HandlePacket(r *stack.Route, vv buffer.VectorisedView) {
-	h := header.IPv4(vv.First())
+	headerView := vv.First()
+	h := header.IPv4(headerView)
 	if !h.IsValid(vv.Size()) {
 		return
 	}
@@ -153,17 +256,16 @@ func (e *endpoint) HandlePacket(r *stack.Route, vv buffer.VectorisedView) {
 	}
 	p := h.TransportProtocol()
 	if p == header.ICMPv4ProtocolNumber {
-		e.handleICMP(r, vv)
+		headerView.CapLength(hlen)
+		e.handleICMP(r, headerView, vv)
 		return
 	}
 	r.Stats().IP.PacketsDelivered.Increment()
-	e.dispatcher.DeliverTransportPacket(r, p, vv)
+	e.dispatcher.DeliverTransportPacket(r, p, headerView, vv)
 }
 
 // Close cleans up resources associated with the endpoint.
-func (e *endpoint) Close() {
-	close(e.echoRequests)
-}
+func (e *endpoint) Close() {}
 
 type protocol struct{}
 
@@ -204,8 +306,8 @@ func (p *protocol) Option(option interface{}) *tcpip.Error {
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
 // payload mtu.
 func calculateMTU(mtu uint32) uint32 {
-	if mtu > maxTotalSize {
-		mtu = maxTotalSize
+	if mtu > MaxTotalSize {
+		mtu = MaxTotalSize
 	}
 	return mtu - header.IPv4MinimumSize
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package tcp
 import (
 	"container/heap"
 
+	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/seqnum"
 )
 
@@ -133,7 +134,7 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 	// sequence numbers that have been consumed.
 	TrimSACKBlockList(&r.ep.sack, r.rcvNxt)
 
-	if s.flagIsSet(flagFin) {
+	if s.flagIsSet(header.TCPFlagFin) {
 		r.rcvNxt++
 
 		// Send ACK immediately.
@@ -181,7 +182,7 @@ func (r *receiver) handleRcvdSegment(s *segment) {
 
 	// Defer segment processing if it can't be consumed now.
 	if !r.consumeSegment(s, segSeq, segLen) {
-		if segLen > 0 || s.flagIsSet(flagFin) {
+		if segLen > 0 || s.flagIsSet(header.TCPFlagFin) {
 			// We only store the segment if it's within our buffer
 			// size limit.
 			if r.pendingBufUsed < r.pendingBufSize {

@@ -1,4 +1,4 @@
-// Copyright 2018 Google LLC
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,10 +28,11 @@ import (
 // NIC represents a "network interface card" to which the networking stack is
 // attached.
 type NIC struct {
-	stack  *Stack
-	id     tcpip.NICID
-	name   string
-	linkEP LinkEndpoint
+	stack    *Stack
+	id       tcpip.NICID
+	name     string
+	linkEP   LinkEndpoint
+	loopback bool
 
 	demux *transportDemuxer
 
@@ -41,6 +42,21 @@ type NIC struct {
 	primary     map[tcpip.NetworkProtocolNumber]*ilist.List
 	endpoints   map[NetworkEndpointID]*referencedNetworkEndpoint
 	subnets     []tcpip.Subnet
+	mcastJoins  map[NetworkEndpointID]int32
+
+	stats NICStats
+}
+
+// NICStats includes transmitted and received stats.
+type NICStats struct {
+	Tx DirectionStats
+	Rx DirectionStats
+}
+
+// DirectionStats includes packet and byte counts.
+type DirectionStats struct {
+	Packets *tcpip.StatCounter
+	Bytes   *tcpip.StatCounter
 }
 
 // PrimaryEndpointBehavior is an enumeration of an endpoint's primacy behavior.
@@ -62,15 +78,27 @@ const (
 	NeverPrimaryEndpoint
 )
 
-func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint) *NIC {
+func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, loopback bool) *NIC {
 	return &NIC{
-		stack:     stack,
-		id:        id,
-		name:      name,
-		linkEP:    ep,
-		demux:     newTransportDemuxer(stack),
-		primary:   make(map[tcpip.NetworkProtocolNumber]*ilist.List),
-		endpoints: make(map[NetworkEndpointID]*referencedNetworkEndpoint),
+		stack:      stack,
+		id:         id,
+		name:       name,
+		linkEP:     ep,
+		loopback:   loopback,
+		demux:      newTransportDemuxer(stack),
+		primary:    make(map[tcpip.NetworkProtocolNumber]*ilist.List),
+		endpoints:  make(map[NetworkEndpointID]*referencedNetworkEndpoint),
+		mcastJoins: make(map[NetworkEndpointID]int32),
+		stats: NICStats{
+			Tx: DirectionStats{
+				Packets: &tcpip.StatCounter{},
+				Bytes:   &tcpip.StatCounter{},
+			},
+			Rx: DirectionStats{
+				Packets: &tcpip.StatCounter{},
+				Bytes:   &tcpip.StatCounter{},
+			},
+		},
 	}
 }
 
@@ -119,16 +147,6 @@ func (n *NIC) getMainNICAddress(protocol tcpip.NetworkProtocolNumber) (tcpip.Add
 
 	}
 
-	// If no primary endpoints then check for other endpoints.
-	if r == nil {
-		for _, ref := range n.endpoints {
-			if ref.holdsInsertRef && ref.tryIncRef() {
-				r = ref
-				break
-			}
-		}
-	}
-
 	if r == nil {
 		return "", tcpip.Subnet{}, tcpip.ErrNoLinkAddress
 	}
@@ -160,7 +178,7 @@ func (n *NIC) primaryEndpoint(protocol tcpip.NetworkProtocolNumber) *referencedN
 
 	for e := list.Front(); e != nil; e = e.Next() {
 		r := e.(*referencedNetworkEndpoint)
-		// TODO: allow broadcast address when SO_BROADCAST is set.
+		// TODO(crawshaw): allow broadcast address when SO_BROADCAST is set.
 		switch r.ep.ID().LocalAddress {
 		case header.IPv4Broadcast, header.IPv4Any:
 			continue
@@ -368,20 +386,62 @@ func (n *NIC) removeEndpoint(r *referencedNetworkEndpoint) {
 	n.mu.Unlock()
 }
 
-// RemoveAddress removes an address from n.
-func (n *NIC) RemoveAddress(addr tcpip.Address) *tcpip.Error {
-	n.mu.Lock()
+func (n *NIC) removeAddressLocked(addr tcpip.Address) *tcpip.Error {
 	r := n.endpoints[NetworkEndpointID{addr}]
 	if r == nil || !r.holdsInsertRef {
-		n.mu.Unlock()
 		return tcpip.ErrBadLocalAddress
 	}
 
 	r.holdsInsertRef = false
-	n.mu.Unlock()
 
-	r.decRef()
+	r.decRefLocked()
 
+	return nil
+}
+
+// RemoveAddress removes an address from n.
+func (n *NIC) RemoveAddress(addr tcpip.Address) *tcpip.Error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.removeAddressLocked(addr)
+}
+
+// joinGroup adds a new endpoint for the given multicast address, if none
+// exists yet. Otherwise it just increments its count.
+func (n *NIC) joinGroup(protocol tcpip.NetworkProtocolNumber, addr tcpip.Address) *tcpip.Error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	id := NetworkEndpointID{addr}
+	joins := n.mcastJoins[id]
+	if joins == 0 {
+		if _, err := n.addAddressLocked(protocol, addr, NeverPrimaryEndpoint, false); err != nil {
+			return err
+		}
+	}
+	n.mcastJoins[id] = joins + 1
+	return nil
+}
+
+// leaveGroup decrements the count for the given multicast address, and when it
+// reaches zero removes the endpoint for this address.
+func (n *NIC) leaveGroup(addr tcpip.Address) *tcpip.Error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	id := NetworkEndpointID{addr}
+	joins := n.mcastJoins[id]
+	switch joins {
+	case 0:
+		// There are no joins with this address on this NIC.
+		return tcpip.ErrBadLocalAddress
+	case 1:
+		// This is the last one, clean up.
+		if err := n.removeAddressLocked(addr); err != nil {
+			return err
+		}
+	}
+	n.mcastJoins[id] = joins - 1
 	return nil
 }
 
@@ -391,7 +451,10 @@ func (n *NIC) RemoveAddress(addr tcpip.Address) *tcpip.Error {
 // Note that the ownership of the slice backing vv is retained by the caller.
 // This rule applies only to the slice itself, not to the items of the slice;
 // the ownership of the items is not retained by the caller.
-func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remoteLinkAddr, localLinkAddr tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, vv buffer.VectorisedView) {
+func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remote, _ tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, vv buffer.VectorisedView) {
+	n.stats.Rx.Packets.Increment()
+	n.stats.Rx.Bytes.IncrementBy(uint64(vv.Size()))
+
 	netProto, ok := n.stack.networkProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -409,9 +472,27 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remoteLinkAddr, localLin
 
 	src, dst := netProto.ParseAddresses(vv.First())
 
+	// If the packet is destined to the IPv4 Broadcast address, then make a
+	// route to each IPv4 network endpoint and let each endpoint handle the
+	// packet.
+	if dst == header.IPv4Broadcast {
+		// n.endpoints is mutex protected so acquire lock.
+		n.mu.RLock()
+		for _, ref := range n.endpoints {
+			if ref.protocol == header.IPv4ProtocolNumber && ref.tryIncRef() {
+				r := makeRoute(protocol, dst, src, linkEP.LinkAddress(), ref, false /* handleLocal */, false /* multicastLoop */)
+				r.RemoteLinkAddress = remote
+				ref.ep.HandlePacket(&r, vv)
+				ref.decRef()
+			}
+		}
+		n.mu.RUnlock()
+		return
+	}
+
 	if ref := n.getRef(protocol, dst); ref != nil {
-		r := makeRoute(protocol, dst, src, linkEP.LinkAddress(), ref)
-		r.RemoteLinkAddress = remoteLinkAddr
+		r := makeRoute(protocol, dst, src, linkEP.LinkAddress(), ref, false /* handleLocal */, false /* multicastLoop */)
+		r.RemoteLinkAddress = remote
 		ref.ep.HandlePacket(&r, vv)
 		ref.decRef()
 		return
@@ -422,7 +503,7 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remoteLinkAddr, localLin
 	//
 	// TODO: Should we be forwarding the packet even if promiscuous?
 	if n.stack.Forwarding() {
-		r, err := n.stack.FindRoute(0, "", dst, protocol)
+		r, err := n.stack.FindRoute(0, "", dst, protocol, false /* multicastLoop */)
 		if err != nil {
 			n.stack.stats.IP.InvalidAddressesReceived.Increment()
 			return
@@ -430,7 +511,7 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remoteLinkAddr, localLin
 		defer r.Release()
 
 		r.LocalLinkAddress = n.linkEP.LinkAddress()
-		r.RemoteLinkAddress = remoteLinkAddr
+		r.RemoteLinkAddress = remote
 
 		// Found a NIC.
 		n := r.ref.nic
@@ -438,6 +519,8 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remoteLinkAddr, localLin
 		ref, ok := n.endpoints[NetworkEndpointID{dst}]
 		n.mu.RUnlock()
 		if ok && ref.tryIncRef() {
+			r.RemoteAddress = src
+			// TODO(b/123449044): Update the source NIC as well.
 			ref.ep.HandlePacket(&r, vv)
 			ref.decRef()
 		} else {
@@ -445,7 +528,14 @@ func (n *NIC) DeliverNetworkPacket(linkEP LinkEndpoint, remoteLinkAddr, localLin
 			// Send the packet out of n.
 			hdr := buffer.NewPrependableFromView(vv.First())
 			vv.RemoveFirst()
-			n.linkEP.WritePacket(&r, hdr, vv, protocol)
+
+			// TODO(b/128629022): use route.WritePacket.
+			if err := n.linkEP.WritePacket(&r, nil /* gso */, hdr, vv, protocol); err != nil {
+				r.Stats().IP.OutgoingPacketErrors.Increment()
+			} else {
+				n.stats.Tx.Packets.Increment()
+				n.stats.Tx.Bytes.IncrementBy(uint64(hdr.UsedLength() + vv.Size()))
+			}
 		}
 		return
 	}
@@ -495,7 +585,7 @@ func (n *NIC) getRef(protocol tcpip.NetworkProtocolNumber, dst tcpip.Address) *r
 
 // DeliverTransportPacket delivers the packets to the appropriate transport
 // protocol endpoint.
-func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, vv buffer.VectorisedView) {
+func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, netHeader buffer.View, vv buffer.VectorisedView) {
 	state, ok := n.stack.transportProtocols[protocol]
 	if !ok {
 		n.stack.stats.UnknownProtocolRcvdPackets.Increment()
@@ -503,6 +593,14 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	}
 
 	transProto := state.proto
+
+	// Raw socket packets are delivered based solely on the transport
+	// protocol number. We do not inspect the payload to ensure it's
+	// validly formed.
+	if !n.demux.deliverRawPacket(r, protocol, netHeader, vv) {
+		n.stack.demux.deliverRawPacket(r, protocol, netHeader, vv)
+	}
+
 	if len(vv.First()) < transProto.MinimumPacketSize() {
 		n.stack.stats.MalformedRcvdPackets.Increment()
 		return
@@ -515,16 +613,16 @@ func (n *NIC) DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolN
 	}
 
 	id := TransportEndpointID{dstPort, r.LocalAddress, srcPort, r.RemoteAddress}
-	if n.demux.deliverPacket(r, protocol, vv, id) {
+	if n.demux.deliverPacket(r, protocol, netHeader, vv, id) {
 		return
 	}
-	if n.stack.demux.deliverPacket(r, protocol, vv, id) {
+	if n.stack.demux.deliverPacket(r, protocol, netHeader, vv, id) {
 		return
 	}
 
 	// Try to deliver to per-stack default handler.
 	if state.defaultHandler != nil {
-		if state.defaultHandler(r, id, vv) {
+		if state.defaultHandler(r, id, netHeader, vv) {
 			return
 		}
 	}
@@ -595,6 +693,14 @@ type referencedNetworkEndpoint struct {
 func (r *referencedNetworkEndpoint) decRef() {
 	if atomic.AddInt32(&r.refs, -1) == 0 {
 		r.nic.removeEndpoint(r)
+	}
+}
+
+// decRefLocked is the same as decRef but assumes that the NIC.mu mutex is
+// locked.
+func (r *referencedNetworkEndpoint) decRefLocked() {
+	if atomic.AddInt32(&r.refs, -1) == 0 {
+		r.nic.removeEndpointLocked(r)
 	}
 }
 
